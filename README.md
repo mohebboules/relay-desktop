@@ -22,8 +22,8 @@ terminal Claude Code → account 2
 [claude-swap](https://github.com/realiti4/claude-swap)), which gives every
 account its own Claude Desktop window, signed in once. `relay` adds:
 
-- **One shared sidebar.** Every account's Code-tab session list points at one
-  "home" account's.
+- **One shared sidebar.** Each switch carries the Code-tab session list from the
+  account you leave to the account you open.
 - **One-command switching.** Closes the open account's window, opens the next,
   and moves terminal Claude Code to the same account.
 - **Sign-in checks.** Warns when a window is signed in as a different account
@@ -72,17 +72,15 @@ aswap add
 
 ## Set up (once)
 
-1. **Close every account's window except the home one** (account 1 by default):
+1. **Open your main account** (the one whose sessions you want everywhere) and
+   close the others: `aswap desktop` lists the windows, `aswap desktop --quit <num>`
+   closes one.
+2. **Copy its sidebar to every account:**
    ```bash
-   aswap desktop
+   relay sync
    ```
-   lists them; `aswap desktop --quit <num>` closes one.
-2. **Share the sidebar:**
-   ```bash
-   relay link
-   ```
-   An account that already had sessions of its own has them moved to
-   `~/.claude-swap-backup/relay-replaced/` — never deleted.
+   It copies from the open window. Sessions another account had on its own are
+   moved to `~/.claude-swap-backup/relay-replaced/`, never deleted.
 3. **Sign each account's window in to the right account.** For every slot:
    ```bash
    relay <num>
@@ -94,9 +92,9 @@ aswap add
    ```
    ```text
    slot  account                              window  signed in as                         sidebar
-   1     me@example.com                       open    ✓ correct                            home
-   2     work@example.com                     closed  ✓ correct                            linked
-   3     side@example.com                     closed  ✗ work@example.com                   linked
+   1     me@example.com                       open    ✓ correct                            newest (12 sessions)
+   2     work@example.com                     closed  ✓ correct                            up to date
+   3     side@example.com                     closed  ✗ work@example.com                   2 behind (catches up on switch)
    ```
    Fix any ✗ by opening that slot (`relay 3`), signing out, and signing in as
    the account in its row. Usage goes to whoever a window is signed in as, not
@@ -108,10 +106,9 @@ aswap add
 |---|---|
 | Move to the next account (1→2→…→1, in aswap's order) | `relay` |
 | Go to a specific account | `relay 3` |
-| Check sign-ins and sharing | `relay status` |
-| See what a command would do | `relay -n`, `relay -n 3`, `relay -n link` |
-| Re-share the sidebar | `relay link` |
-| Go back to separate sidebars | `relay unlink` |
+| Check sign-ins and sidebars | `relay status` |
+| Copy the newest sidebar to every closed account now | `relay sync` |
+| See what a command would do | `relay -n`, `relay -n 3`, `relay -n sync` |
 
 When an account hits its limit:
 
@@ -130,7 +127,7 @@ in the shortcut's details, **Add Keyboard Shortcut**.
 
 | Option / variable | Default | Meaning |
 |---|---|---|
-| `--home <num>` / `RELAY_HOME` | `1` | Account whose sidebar everyone shares |
+| `--from <num>` | open window, else last used | With `sync`: the account to copy from |
 | `-n`, `--dry-run` | | Print what would happen, change nothing |
 | `--force` | | Switch even from inside a Claude session |
 | `RELAY_ASWAP` | `aswap` | aswap command to call |
@@ -154,13 +151,18 @@ every account reads. aswap already points every account's window at that one
 `claude-code-sessions` folder, but each window still reads only its own
 `<account>/<org>` sub-folder.
 
-`relay link` turns every other account's sub-folder into a symlink to the home
-account's:
+When you switch, `relay` closes the open window, then makes the next account's
+sub-folder match the one you just left: new and changed session files are
+copied, and files the other account no longer has are moved aside to
+`~/.claude-swap-backup/relay-replaced/`. Only `local_*.json` files are copied;
+the rest of each folder (scheduled tasks and other per-account state) stays
+with its account. With no window open, the account used most recently is the
+source.
 
-```text
-<account-2>/<org-2>  →  <account-1>/<org-1>
-<account-3>/<org-3>  →  <account-1>/<org-1>
-```
+Why copy instead of a symlink? Claude Desktop saves session files with a call
+that refuses to follow symlinks, so a linked folder can be read but not saved
+into. relay 1.x linked the folders; `relay sync` (or any switch) converts those
+links to real folders.
 
 Account IDs and order come from aswap's `~/.claude-swap-backup/sequence.json`.
 The sign-in check reads `lastKnownAccountUuid` from each window's
@@ -168,9 +170,9 @@ The sign-in check reads `lastKnownAccountUuid` from each window's
 
 ## Limitations
 
-- **One window at a time.** Two windows open on the shared sidebar don't see each
-  other's changes and can overwrite each other. `relay` closes the old window
-  before opening the new one; if you open two by hand, press ⌘R in one to reload.
+- **One window at a time.** Changes are carried over when you switch with `relay`.
+  If you open two accounts' windows by hand, each keeps its own changes until the
+  next `relay` switch or `relay sync`, and the last-used one wins.
 - **Switching stops running work.** Closing a window ends any session that is
   mid-reply.
 - **Unofficial.** A Claude Desktop update can change the file layout; `relay status`
@@ -181,8 +183,8 @@ The sign-in check reads `lastKnownAccountUuid` from each window's
 
 | Symptom | Fix |
 |---|---|
-| A window shows an empty sidebar | Close it, `relay link`, open it again |
-| `status` shows `private` or `missing` | Close that window, `relay link` |
+| A window shows an empty or old sidebar | Close it, `relay sync`, open it again |
+| `status` shows `old link` | `relay sync` |
 | `status` shows ✗ | Open that slot, sign out, sign in as the right account |
 | `relay: command not found` | Run `./install.sh`; check `~/.local/bin` is on `PATH` |
 | `'aswap' not found` | Install aswap, or set `RELAY_ASWAP` |
@@ -190,14 +192,10 @@ The sign-in check reads `lastKnownAccountUuid` from each window's
 ## Uninstall
 
 ```bash
-relay unlink
-```
-```bash
 rm ~/.local/bin/relay
 ```
 
-`unlink` removes only the symlinks; the home account keeps every session, and the
-other accounts start with empty sidebars again.
+Every account keeps a real copy of the sidebar it last had; nothing else to undo.
 
 ## Development
 

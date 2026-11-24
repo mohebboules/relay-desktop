@@ -2,25 +2,25 @@
 """relay (relay-desktop) — one Claude Desktop sidebar across several Claude accounts.
 
 Built on aswap (https://github.com/BlackHole1/aswap), which gives every account
-its own Claude Desktop window. relay links each account's Code-tab session list
-to one "home" account's, so every window shows the same sessions, and switches
+its own Claude Desktop window. Claude Desktop keeps a separate Code-tab session
+list per account; relay carries that list from the account you leave to the
+account you open, so every account shows the same sessions, and switches
 between accounts with one command.
 
 usage:
   relay                 switch to the next account in aswap's order
   relay <num>           switch to that account
-  relay status          per account: window open?, signed in as whom?, sidebar shared?
-  relay link            share the home account's sidebar with every account
-  relay unlink          undo `link`: every account gets its own sidebar again
+  relay status          per account: window open?, signed in as whom?, sidebar up to date?
+  relay sync            copy the newest sidebar to every account whose window is closed
   relay help | version
 
 options:
   -n, --dry-run         say what would happen, change nothing
-  --home <num>          the account whose sidebar is shared (default 1, or $RELAY_HOME)
+  --from <num>          with sync: copy this account's sidebar (default: the open
+                        window's, else the most recently used one)
   --force               switch even when run from inside a Claude session
 
 environment:
-  RELAY_HOME            home account number (default 1)
   RELAY_ASWAP           aswap command (default: aswap)
   RELAY_BACKUP_DIR      aswap's data dir (default: ~/.claude-swap-backup)
   RELAY_SESSIONS_DIR    Claude Desktop's session dir
@@ -29,6 +29,7 @@ environment:
   NO_COLOR              disable colors
 """
 
+import filecmp
 import json
 import os
 import shutil
@@ -37,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 
 def env_path(name, default):
@@ -50,6 +51,7 @@ SESSIONS = env_path(
     "RELAY_SESSIONS_DIR", "~/Library/Application Support/Claude/claude-code-sessions"
 )
 SIGNIN_WAIT_S = int(os.environ.get("RELAY_SIGNIN_WAIT", "20"))
+SIDEBAR_GLOB = "local_*.json"  # one file per session; everything else stays per account
 
 _color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -119,7 +121,7 @@ def aswap(*args, quiet=False):
     try:
         return subprocess.run([ASWAP, *args], text=True, capture_output=quiet)
     except FileNotFoundError:
-        raise RelayError(f"'{ASWAP}' not found: install aswap (uv tool install aswap)")
+        raise RelayError(f"'{ASWAP}' not found: run ./install.sh (or uv tool install aswap)")
 
 
 def open_windows():
@@ -133,79 +135,96 @@ def open_windows():
     return nums
 
 
-# -- sidebar links ------------------------------------------------------------
+# -- sidebar folders ----------------------------------------------------------
+#
+# Claude Desktop lists an account's Code sessions from
+# <SESSIONS>/<account uuid>/<org uuid>/local_<id>.json. It saves into that
+# folder with a call that refuses symlinks, so each account needs a real
+# folder; relay keeps them the same by copying.
 
 def session_dir(a):
     return SESSIONS / a["uuid"] / a["org"]
 
 
-def link_state(a, home):
-    if a["num"] == home["num"]:
-        return "home"
+def sidebar_files(d):
+    return {p.name: p for p in d.glob(SIDEBAR_GLOB)} if d.is_dir() else {}
+
+
+def last_used(d):
+    """When the app last wrote this account's sidebar (0 if never)."""
+    return max((p.stat().st_mtime for p in sidebar_files(d).values()), default=0)
+
+
+def newest_account(accts, order, among=None):
+    nums = [n for n in (among or order) if session_dir(accts[n]).is_dir()]
+    return max(nums, key=lambda n: last_used(session_dir(accts[n])), default=None)
+
+
+def differences(src, dst):
+    s, d = sidebar_files(src), sidebar_files(dst)
+    changed = [n for n in s if n not in d or not filecmp.cmp(s[n], d[n], shallow=False)]
+    removed = [n for n in d if n not in s]
+    return changed, removed
+
+
+def make_real(a, dry=False):
+    """Turn an old relay-1.x symlinked folder into a real one with the same
+    sessions. Safe while that account's window is open: the sessions are
+    identical at that moment, and the app can save again right after."""
     d = session_dir(a)
-    if d.is_symlink():
-        return "linked" if d.resolve() == session_dir(home).resolve() else "linked-elsewhere"
-    return "private" if d.exists() else "missing"
+    if not d.is_symlink():
+        return False
+    if dry:
+        print(f"  {a['num']} {a['email']}: would turn the old link into a real folder")
+        return True
+    src = d.resolve()
+    tmp = d.with_name(d.name + ".relay-tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(mode=0o700)
+    for name, p in sidebar_files(src).items():
+        shutil.copy2(p, tmp / name)
+    d.unlink()  # the link only
+    tmp.rename(d)
+    print(f"  {G}{a['num']} {a['email']}: old link replaced by a real folder{X}")
+    return True
 
 
-def link(accts, order, home, dry=False, only=None):
-    target = session_dir(home)
-    if target.is_symlink():
-        raise RelayError(f"the home account's session folder is itself a link: {target}")
-    if not dry:
-        target.mkdir(mode=0o700, parents=True, exist_ok=True)
-    opened = open_windows()
-    stash = None
-    for n in only or order:
-        a = accts[n]
-        st = link_state(a, home)
-        label = f"{n} {a['email']}"
-        if st in ("home", "linked"):
-            print(f"  {label}: {st}")
-            continue
-        if n in opened:
-            print(f"  {Y}{label}: window is open; close it ({ASWAP} desktop --quit {n}) and rerun{X}")
-            continue
-        if dry:
-            print(f"  {label}: would link ({st})")
-            continue
-        d = session_dir(a)
-        if st == "linked-elsewhere":
-            d.unlink()
-        elif st == "private":
-            # Never delete what an account had on its own: move it aside.
-            stash = stash or BACKUP / "relay-replaced" / time.strftime("%Y%m%dT%H%M%S")
-            stash.mkdir(parents=True, exist_ok=True)
-            own = list(d.rglob("local_*.json"))
-            shutil.move(str(d), str(stash / f"{n}-{a['uuid']}"))
-            if own:
-                print(f"  {Y}{label}: its {len(own)} own session(s) were moved to {stash}{X}")
-        d.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        d.symlink_to(target, target_is_directory=True)
-        print(f"  {G}{label}: linked{X}")
+def mirror(src_acct, dst_acct, stash, dry=False):
+    """Make dst's session list equal to src's. Files dst has that src doesn't
+    are moved into `stash`, never deleted."""
+    src, dst = session_dir(src_acct), session_dir(dst_acct)
+    changed, removed = differences(src, dst)
+    label = f"{src_acct['num']} → {dst_acct['num']}"
+    if not changed and not removed:
+        print(f"  {label}: already the same")
+        return
+    if dry:
+        print(f"  {label}: would copy {len(changed)}, set aside {len(removed)}")
+        return
+    dst.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name in changed:
+        tmp = dst / (name + ".relay-tmp")
+        shutil.copy2(src / name, tmp)
+        os.replace(tmp, dst / name)
+    if removed:
+        where = stash / dst_acct["num"]
+        where.mkdir(parents=True, exist_ok=True)
+        for name in removed:
+            shutil.move(str(dst / name), str(where / name))
+    print(f"  {G}{label}: copied {len(changed)}"
+          + (f", set aside {len(removed)} (in {stash})" if removed else "") + X)
 
 
-def unlink(accts, order, home, dry=False):
-    opened = [n for n in open_windows() if n != home["num"]]
-    if opened and not dry:
-        raise RelayError(f"close these accounts' windows first: {', '.join(opened)}")
-    for n in order:
-        a = accts[n]
-        st = link_state(a, home)
-        if st in ("linked", "linked-elsewhere"):
-            if dry:
-                print(f"  {n} {a['email']}: would unlink")
-            else:
-                session_dir(a).unlink()  # a symlink: removes the link only
-                print(f"  {n} {a['email']}: unlinked (own empty sidebar)")
-        else:
-            print(f"  {n} {a['email']}: {st}")
+def new_stash():
+    return BACKUP / "relay-replaced" / time.strftime("%Y%m%dT%H%M%S")
 
 
 # -- commands -----------------------------------------------------------------
 
-def status(accts, order, home):
+def status(accts, order):
     opened = open_windows()
+    newest = newest_account(accts, order)
     problems = 0
     print(f"{B}{'slot':<5} {'account':<36} {'window':<7} {'signed in as':<36} sidebar{X}")
     for n in order:
@@ -218,22 +237,54 @@ def status(accts, order, home):
         else:
             other = find_account(accts, u)
             signed, sc = f"✗ {other['email'] if other else u}", R
-        ls = link_state(a, home)
-        ok_link = ls in ("home", "linked")
-        problems += (u != a["uuid"]) + (not ok_link)
+        problems += u != a["uuid"]
+
+        d = session_dir(a)
+        if d.is_symlink():
+            side, lc = "old link: run relay sync", R
+            problems += 1
+        elif not d.is_dir():
+            side, lc = "empty (filled on switch)", D
+        elif n == newest:
+            side, lc = f"newest ({len(sidebar_files(d))} sessions)", G
+        else:
+            ch, rm = differences(session_dir(accts[newest]), d)
+            side, lc = ("up to date", G) if not ch and not rm else \
+                (f"{len(ch) + len(rm)} behind (catches up on switch)", Y)
         win = "open" if n in opened else "closed"
         print(f"{n:<5} {a['email']:<36} {(G if win == 'open' else D)}{win:<7}{X} "
-              f"{sc}{signed:<36}{X} {G if ok_link else R}{ls}{X}")
+              f"{sc}{signed:<36}{X} {lc}{side}{X}")
     if problems:
         print(f"\n{Y}✗ or not signed in: `relay <slot>`, sign out in that window if needed, "
               f"sign in as the account in its row.\n"
-              f"sidebar not shared: close that account's window, then `relay link`.{X}")
+              f"old link: run `relay sync` (relay 1.x shared the sidebar by linking, "
+              f"which Claude Desktop can't save into).{X}")
         return 1
-    print(f"\n{G}All accounts signed in correctly and sharing one sidebar.{X}")
+    print(f"\n{G}All accounts signed in correctly.{X}")
     return 0
 
 
-def switch(accts, order, home, target=None, dry=False, force=False):
+def sync(accts, order, src=None, dry=False):
+    opened = open_windows()
+    for n in order:
+        make_real(accts[n], dry=dry)
+    if src is None:
+        src = opened[0] if len(opened) == 1 else newest_account(accts, order)
+    if src not in accts:
+        raise RelayError(f"no account {src} (have {', '.join(order)})")
+    print(f"copying account {src}'s sidebar ({len(sidebar_files(session_dir(accts[src])))} sessions)")
+    stash = new_stash()
+    for n in order:
+        if n == src:
+            continue
+        if n in opened:
+            print(f"  {Y}{src} → {n}: skipped, window open (it catches up when you switch to it){X}")
+            continue
+        mirror(accts[src], accts[n], stash, dry=dry)
+    return 0
+
+
+def switch(accts, order, target=None, dry=False, force=False):
     if os.environ.get("CLAUDECODE") and not dry and not force:
         raise RelayError(
             "you seem to be inside a Claude session: switching closes Claude Desktop's "
@@ -246,7 +297,10 @@ def switch(accts, order, home, target=None, dry=False, force=False):
     if target not in accts:
         raise RelayError(f"no account {target} (have {', '.join(order)})")
     a = accts[target]
-    print(f"open now: {', '.join(opened) or 'none'}  →  account {target} ({a['email']})")
+    # The sidebar to carry over: the window being closed, else the last one used.
+    src = next((n for n in opened if n != target), None) or newest_account(accts, order)
+    print(f"open now: {', '.join(opened) or 'none'}  →  account {target} ({a['email']})"
+          + (f", taking account {src}'s sidebar" if src and src != target else ""))
     if dry:
         return 0
 
@@ -254,8 +308,11 @@ def switch(accts, order, home, target=None, dry=False, force=False):
         if n != target and aswap("desktop", "--quit", n).returncode != 0:
             raise RelayError(f"could not close account {n}'s window; stopping")
 
-    if link_state(a, home) not in ("home", "linked"):
-        link(accts, order, home, only=[target])
+    if target not in opened:
+        for n in {src, target} - {None}:
+            make_real(accts[n])
+        if src and src != target:
+            mirror(accts[src], a, new_stash())
 
     # Terminal Claude Code follows, so both bill the same account.
     if aswap("switch", target, quiet=True).returncode == 0:
@@ -289,7 +346,7 @@ def check_signin(accts, a):
 
 def main(argv):
     dry = force = False
-    home_num = os.environ.get("RELAY_HOME", "1")
+    src = None
     args = []
     it = iter(argv)
     for arg in it:
@@ -297,8 +354,8 @@ def main(argv):
             dry = True
         elif arg == "--force":
             force = True
-        elif arg == "--home":
-            home_num = next(it, "")
+        elif arg == "--from":
+            src = next(it, "")
         elif arg in ("-h", "--help", "help"):
             print(__doc__.strip())
             return 0
@@ -309,20 +366,14 @@ def main(argv):
             args.append(arg)
 
     accts, order = load_accounts()
-    if home_num not in accts:
-        raise RelayError(f"home account {home_num!r} isn't one of aswap's accounts ({', '.join(order)})")
-    home = accts[home_num]
-
     cmd = args[0] if args else None
     if cmd == "status":
-        return status(accts, order, home)
-    if cmd == "link":
-        link(accts, order, home, dry=dry)
-        return 0
+        return status(accts, order)
+    if cmd in ("sync", "link"):  # `link` was relay 1.x's name for this
+        return sync(accts, order, src=src, dry=dry)
     if cmd == "unlink":
-        unlink(accts, order, home, dry=dry)
-        return 0
-    return switch(accts, order, home, target=cmd, dry=dry, force=force)
+        raise RelayError("relay 2 no longer links folders; nothing to undo (see `relay sync`)")
+    return switch(accts, order, target=cmd, dry=dry, force=force)
 
 
 if __name__ == "__main__":
